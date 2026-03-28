@@ -40,6 +40,40 @@ function proxify(origin, absoluteUrl) {
   return `${origin}/api/go?url=${encodeURIComponent(absoluteUrl)}`;
 }
 
+function getOriginFromReq(req) {
+  return `${req.headers["x-forwarded-proto"] || "https"}://${req.headers.host}`;
+}
+
+function unwrapProxyChain(urlString, selfOrigin) {
+  let current = String(urlString || "");
+  let hops = 0;
+
+  while (hops < 10) {
+    let parsed;
+    try {
+      parsed = new URL(current);
+    } catch {
+      break;
+    }
+
+    const isSelfProxy =
+      parsed.origin === selfOrigin &&
+      parsed.pathname === "/api/go" &&
+      parsed.searchParams.has("url");
+
+    if (!isSelfProxy) break;
+
+    current = parsed.searchParams.get("url") || "";
+    hops += 1;
+  }
+
+  return current;
+}
+
+function isSelfProxyTarget(target, selfOrigin) {
+  return target.origin === selfOrigin && target.pathname === "/api/go";
+}
+
 function rewriteCssUrls(css, baseUrl, origin) {
   return String(css).replace(/url\((['"]?)(.*?)\1\)/gi, (_, q, raw) => {
     const v = String(raw || "").trim();
@@ -74,7 +108,14 @@ function injectClient(baseUrl, origin) {
     return !s || s.startsWith("#") || s.startsWith("javascript:") || s.startsWith("mailto:") || s.startsWith("tel:") || s.startsWith("data:") || s.startsWith("blob:");
   };
 
-  const isAlreadyProxied = (u) => /\\/api\\/go\\?url=/i.test(String(u || ""));
+  const isAlreadyProxied = (u) => {
+    try {
+      const parsed = new URL(String(u), location.href);
+      return parsed.origin === VOID_ORIGIN && parsed.pathname === "/api/go" && parsed.searchParams.has("url");
+    } catch {
+      return /\\/api\\/go\\?url=/i.test(String(u || ""));
+    }
+  };
 
   const abs = (u) => {
     try { return new URL(u, VOID_BASE).toString(); }
@@ -100,16 +141,24 @@ function injectClient(baseUrl, origin) {
   const oldFetch = window.fetch;
   window.fetch = function(input, init) {
     try {
-      if (typeof input === "string") input = proxify(input);
-      else if (input instanceof URL) input = proxify(input.toString());
-      else if (input && input.url) input = new Request(proxify(input.url), input);
+      if (typeof input === "string") {
+        if (!isAlreadyProxied(input) && !shouldSkip(input)) input = proxify(input);
+      } else if (input instanceof URL) {
+        const url = input.toString();
+        if (!isAlreadyProxied(url) && !shouldSkip(url)) input = proxify(url);
+      } else if (input && input.url) {
+        const url = input.url;
+        if (!isAlreadyProxied(url) && !shouldSkip(url)) input = new Request(proxify(url), input);
+      }
     } catch {}
     return oldFetch.call(this, input, init);
   };
 
   const xhrOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-    try { url = proxify(url); } catch {}
+    try {
+      if (!isAlreadyProxied(url) && !shouldSkip(url)) url = proxify(url);
+    } catch {}
     return xhrOpen.call(this, method, url, ...rest);
   };
 
@@ -266,15 +315,23 @@ export default async function handler(req, res) {
     return res.status(204).end();
   }
 
-  const { url } = req.query;
-  if (!url) return res.status(400).send("Missing url");
+  const selfOrigin = getOriginFromReq(req);
+
+  let rawUrl = req.query?.url;
+  if (!rawUrl) return res.status(400).send("Missing url");
+
+  rawUrl = unwrapProxyChain(rawUrl, selfOrigin);
 
   let target;
   try {
-    target = new URL(url);
+    target = new URL(rawUrl);
     if (!/^https?:$/.test(target.protocol)) throw new Error("Bad protocol");
   } catch {
     return res.status(400).send("Invalid URL");
+  }
+
+  if (isSelfProxyTarget(target, selfOrigin)) {
+    return res.status(400).send("Refusing self-proxy loop");
   }
 
   try {
@@ -296,7 +353,6 @@ export default async function handler(req, res) {
 
     const response = await fetch(target.toString(), init);
     const contentType = response.headers.get("content-type") || "";
-    const origin = `${req.headers["x-forwarded-proto"] || "https"}://${req.headers.host}`;
 
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS");
@@ -332,13 +388,13 @@ export default async function handler(req, res) {
     if (isHtml(contentType)) {
       const html = await response.text();
       res.setHeader("content-type", "text/html; charset=utf-8");
-      return res.status(response.status).send(rewriteHtml(html, target.toString(), origin));
+      return res.status(response.status).send(rewriteHtml(html, target.toString(), selfOrigin));
     }
 
     if (isCss(contentType)) {
       const css = await response.text();
       res.setHeader("content-type", "text/css; charset=utf-8");
-      return res.status(response.status).send(rewriteCssUrls(css, target.toString(), origin));
+      return res.status(response.status).send(rewriteCssUrls(css, target.toString(), selfOrigin));
     }
 
     const buf = Buffer.from(await response.arrayBuffer());
