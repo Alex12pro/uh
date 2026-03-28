@@ -1,10 +1,20 @@
-# Void Vercel Fix v2
+Void rebuilt proxy system
 
-This update fixes the net::ERR_CONTENT_DECODING_FAILED issue.
+Files:
+- public/index.html
+- api/proxy/index.js
+- api/proxy/[...target].js
+- api/proxy/shared.js
+- vercel.json
 
-What changed:
-- Forces upstream requests to ask for identity encoding
-- Strips content-encoding and transfer-encoding from proxied responses
-- Resets HTML and CSS content-type headers after rewriting
+Major changes:
+- path-based target encoding instead of nested query rewriting
+- self-proxy loop detection and unwrapping
+- safer client-side URL interception
+- POST JSON bridge for many non-file form submits
+- response header stripping for iframe compatibility
 
-Deploy this version to Vercel and replace the old one.
+Notes:
+- This should remove proxy-caused recursion and malformed URL problems.
+- Browser extensions such as ad blockers can still block some upstream resources.
+- Some anti-bot sites and complex apps may still refuse to work because that is controlled by the remote site.
